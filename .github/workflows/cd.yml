@@ -7,95 +7,72 @@ on:
 jobs:
   cd:
     runs-on: ubuntu-latest
-
     env:
       AWS_REGION: ap-northeast-1
-      ECR_REPO_URL: ${{ secrets.ECR_REPO_URL }}  # Docker repo URL from secrets
 
     steps:
 
-    # 1️⃣ Checkout manifests repo
     - name: Checkout manifests repo
       uses: actions/checkout@v3
 
-    # 2️⃣ Configure AWS credentials
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
+        aws-region: ${{ secrets.AWS_REGION }}
 
-    # 3️⃣ Extract payload from CI
     - name: Extract Payload
       run: |
         echo "IMAGE_TAG=${{ github.event.client_payload.image_tag }}" >> $GITHUB_ENV
         echo "BRANCH_NAME=${{ github.event.client_payload.branch }}" >> $GITHUB_ENV
 
-    # 4️⃣ Determine environment, cluster, namespace dynamically
-    - name: Determine Environment & Cluster
+    - name: Determine Target Environment
       run: |
-        BRANCH_NAME=$BRANCH_NAME
+        if [[ "$BRANCH_NAME" == feature/* ]]; then
+          echo "ENVIRONMENT=dev" >> $GITHUB_ENV
+          echo "CLUSTER_NAME=eks-dev-cluster" >> $GITHUB_ENV
+        elif [[ "$BRANCH_NAME" == main ]]; then
+          echo "ENVIRONMENT=stage" >> $GITHUB_ENV
+          echo "CLUSTER_NAME=eks-stage-cluster" >> $GITHUB_ENV
+        elif [[ "$BRANCH_NAME" == release/* ]]; then
+          echo "ENVIRONMENT=uat" >> $GITHUB_ENV
+          echo "CLUSTER_NAME=eks-uat-cluster" >> $GITHUB_ENV
+        elif [[ "$BRANCH_NAME" == production ]]; then
+          echo "ENVIRONMENT=prod" >> $GITHUB_ENV
+          echo "CLUSTER_NAME=eks-prod-cluster" >> $GITHUB_ENV
+        else
+          echo "ENVIRONMENT=dev" >> $GITHUB_ENV
+          echo "CLUSTER_NAME=eks-dev-cluster" >> $GITHUB_ENV
+        fi
 
-        # Branch -> environment:cluster mapping
-        declare -A ENV_MAP=(
-          ["feature/*"]="dev:eks-dev-cluster"
-          ["main"]="stage:eks-stage-cluster"
-          ["release/*"]="uat:eks-uat-cluster"
-          ["production"]="prod:eks-prod-cluster"
-        )
-
-        ENVIRONMENT=""
-        CLUSTER_NAME=""
-
-        # Match branch pattern
-        for pattern in "${!ENV_MAP[@]}"; do
-          if [[ "$BRANCH_NAME" == $pattern ]]; then
-            IFS=':' read -r ENVIRONMENT CLUSTER_NAME <<< "${ENV_MAP[$pattern]}"
-          fi
-        done
-
-        # Defaults
-        ENVIRONMENT=${ENVIRONMENT:-dev}
-        CLUSTER_NAME=${CLUSTER_NAME:-eks-dev-cluster}
-
-        echo "ENVIRONMENT=$ENVIRONMENT" >> $GITHUB_ENV
-        echo "CLUSTER_NAME=$CLUSTER_NAME" >> $GITHUB_ENV
-
-        echo "Namespace: $ENVIRONMENT"
-        echo "Cluster: $CLUSTER_NAME"
-
-    # 5️⃣ Update Kubernetes manifest with new image
     - name: Update Kubernetes Manifest
       run: |
         FILE="${ENVIRONMENT}/deployment.yaml"
-        if [[ -f "$FILE" ]]; then
-          echo "Updating $FILE with image tag $IMAGE_TAG"
-          sed -i "s|image: .*|image: ${ECR_REPO_URL}:${IMAGE_TAG}|g" $FILE
-        else
-          echo "Manifest $FILE not found"
-          exit 1
-        fi
+        echo "Updating $FILE with image tag $IMAGE_TAG"
+        sed -i "s|image: .*|image: 541320879609.dkr.ecr.ap-northeast-1.amazonaws.com/cicd:${IMAGE_TAG}|g" $FILE
 
-    # 6️⃣ Commit & push updated manifest (safe commit)
     - name: Commit & Push Updated Manifest
       run: |
         git config user.name "github-actions"
         git config user.email "github-actions@github.com"
         git add .
-        git diff --cached --quiet || git commit -m "Deploy image ${IMAGE_TAG} to ${ENVIRONMENT} environment"
-        git push origin main || echo "No changes to push"
+        git commit -m "Deploy image ${IMAGE_TAG} to ${ENVIRONMENT} environment" || echo "No changes to commit"
+        git push https://${{ secrets.PERSONAL_ACCESS_TOKEN }}@github.com/abhi10011990/manifests-repo.git
 
-    # 7️⃣ Install kubectl
     - name: Install kubectl
       uses: azure/setup-kubectl@v3
 
-    # 8️⃣ Update kubeconfig dynamically
     - name: Update kubeconfig for EKS
       run: |
-        aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME
+        aws eks update-kubeconfig \
+          --region $AWS_REGION \
+          --name $CLUSTER_NAME || echo "Cluster not found, skipping EKS deployment"
 
-    # 9️⃣ Apply manifest to target namespace
-    - name: Apply Manifest to EKS
+    - name: Apply Manifest to Kubernetes
       run: |
-        kubectl apply -n $ENVIRONMENT -f ${ENVIRONMENT}/deployment.yaml
+        if kubectl config current-context; then
+          kubectl apply -f ${ENVIRONMENT}/deployment.yaml
+        else
+          echo "No cluster context, skipping deployment (use KinD or EKS later)"
+        fi
