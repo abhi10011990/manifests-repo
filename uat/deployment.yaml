@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-app
+  labels:
+    app: demo-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: demo-app
+  template:
+    metadata:
+      labels:
+        app: demo-app
+    spec:
+      containers:
+        - name: demo-app
+          image: PLACEHOLDER_IMAGE
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "1Gi"
+              cpu: "1"
+          env:
+            - name: ENV
+              value: uat
+            - name: LOG_LEVEL
+              value: INFO
+            - name: FEATURE_FLAG
+              value: "false"
+            - name: IMAGE_TAG
+              value: PLACEHOLDER_IMAGE
