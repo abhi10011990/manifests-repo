@@ -11,10 +11,11 @@ jobs:
       AWS_REGION: ap-northeast-1
 
     steps:
-
+    # 1️⃣ Checkout manifests repo
     - name: Checkout manifests repo
       uses: actions/checkout@v3
 
+    # 2️⃣ Configure AWS credentials
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
@@ -22,11 +23,13 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ secrets.AWS_REGION }}
 
+    # 3️⃣ Extract payload from CI
     - name: Extract Payload
       run: |
         echo "IMAGE_TAG=${{ github.event.client_payload.image_tag }}" >> $GITHUB_ENV
         echo "BRANCH_NAME=${{ github.event.client_payload.branch }}" >> $GITHUB_ENV
 
+    # 4️⃣ Determine environment & cluster dynamically
     - name: Determine Target Environment
       run: |
         if [[ "$BRANCH_NAME" == feature/* ]]; then
@@ -46,33 +49,43 @@ jobs:
           echo "CLUSTER_NAME=eks-dev-cluster" >> $GITHUB_ENV
         fi
 
+    # 5️⃣ Update Kubernetes manifest with new image
     - name: Update Kubernetes Manifest
       run: |
         FILE="${ENVIRONMENT}/deployment.yaml"
         echo "Updating $FILE with image tag $IMAGE_TAG"
         sed -i "s|image: .*|image: 541320879609.dkr.ecr.ap-northeast-1.amazonaws.com/cicd:${IMAGE_TAG}|g" $FILE
 
+    # 6️⃣ Commit & Push updated manifest (PAT required)
     - name: Commit & Push Updated Manifest
       run: |
         git config user.name "github-actions"
         git config user.email "github-actions@github.com"
         git add .
-        git commit -m "Deploy image ${IMAGE_TAG} to ${ENVIRONMENT} environment" || echo "No changes to commit"
-        git push https://${{ secrets.PERSONAL_ACCESS_TOKEN }}@github.com/abhi10011990/manifests-repo.git
+        git diff-index --quiet HEAD || git commit -m "Deploy image ${IMAGE_TAG} to ${ENVIRONMENT} environment"
+        git push https://${{ secrets.PERSONAL_ACCESS_TOKEN }}@github.com/abhi10011990/manifests-repo.git main
 
+    # 7️⃣ Install kubectl
     - name: Install kubectl
       uses: azure/setup-kubectl@v3
 
+    # 8️⃣ Update kubeconfig for EKS
     - name: Update kubeconfig for EKS
       run: |
-        aws eks update-kubeconfig \
-          --region $AWS_REGION \
-          --name $CLUSTER_NAME || echo "Cluster not found, skipping EKS deployment"
+        echo "Checking if cluster $CLUSTER_NAME exists..."
+        if aws eks describe-cluster --name $CLUSTER_NAME --region $AWS_REGION >/dev/null 2>&1; then
+          echo "Cluster exists, updating kubeconfig"
+          aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME
+        else
+          echo "Cluster not found, skipping deployment. You can deploy locally or wait for EKS cluster."
+        fi
 
+    # 9️⃣ Apply manifest to Kubernetes (EKS or local)
     - name: Apply Manifest to Kubernetes
       run: |
-        if kubectl config current-context; then
+        if kubectl config current-context >/dev/null 2>&1; then
+          echo "Deploying to cluster..."
           kubectl apply -f ${ENVIRONMENT}/deployment.yaml
         else
-          echo "No cluster context, skipping deployment (use KinD or EKS later)"
+          echo "No cluster context, skipping deployment. Use KinD or create EKS cluster later."
         fi
