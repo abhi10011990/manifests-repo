@@ -3,12 +3,15 @@ name: CD Pipeline
 on:
   repository_dispatch:
     types: [deploy]
+  push:
+    tags:
+      - 'v*.*.*'  # triggers production on version tag
 
 jobs:
   cd:
     runs-on: ubuntu-latest
 
-    # 🔴 THIS LINE ENABLES GITHUB ENVIRONMENTS + APPROVALS
+    # Environment is dynamically set based on branch/tag
     environment: ${{ env.ENVIRONMENT }}
 
     env:
@@ -17,7 +20,7 @@ jobs:
 
     steps:
 
-    # 1️⃣ Checkout manifests repository (GitOps)
+    # 1️⃣ Checkout manifests repo
     - name: Checkout manifests repo
       uses: actions/checkout@v3
       with:
@@ -31,28 +34,20 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ secrets.AWS_REGION }}
 
-    # 3️⃣ Extract & validate payload from CI
-    - name: Extract Payload (with validation)
+    # 3️⃣ Extract payload
+    - name: Extract Payload
       run: |
         IMAGE_TAG="${{ github.event.client_payload.image_tag }}"
         IMAGE_DIGEST="${{ github.event.client_payload.image_digest }}"
         BRANCH_NAME="${{ github.event.client_payload.branch }}"
-
-        echo "🔍 Payload received from CI:"
-        echo "IMAGE_TAG=$IMAGE_TAG"
-        echo "IMAGE_DIGEST=$IMAGE_DIGEST"
-        echo "BRANCH_NAME=$BRANCH_NAME"
-
-        if [[ -z "$IMAGE_TAG" || -z "$IMAGE_DIGEST" || -z "$BRANCH_NAME" ]]; then
-          echo "❌ ERROR: Missing payload from CI. Failing CD safely."
-          exit 1
-        fi
+        TAG_NAME="${{ github.ref_name }}"
 
         echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
         echo "IMAGE_DIGEST=$IMAGE_DIGEST" >> $GITHUB_ENV
         echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
+        echo "TAG_NAME=$TAG_NAME" >> $GITHUB_ENV
 
-    # 4️⃣ Determine environment & cluster based on branch
+    # 4️⃣ Determine environment and cluster
     - name: Determine Target Environment
       run: |
         case "$BRANCH_NAME" in
@@ -68,7 +63,7 @@ jobs:
             echo "ENVIRONMENT=uat" >> $GITHUB_ENV
             echo "CLUSTER_NAME=eks-uat-cluster" >> $GITHUB_ENV
             ;;
-          production)
+          production|v*.*.*)
             echo "ENVIRONMENT=prod" >> $GITHUB_ENV
             echo "CLUSTER_NAME=eks-prod-cluster" >> $GITHUB_ENV
             ;;
@@ -78,25 +73,20 @@ jobs:
             ;;
         esac
 
-        echo "🚀 Deploying to environment: $ENVIRONMENT"
-        echo "🎯 Target cluster: $CLUSTER_NAME"
-
-    # 5️⃣ Update Kubernetes manifest using IMAGE DIGEST (immutable)
+    # 5️⃣ Update Kubernetes manifest with immutable image
     - name: Update Kubernetes Manifest
       run: |
         FILE="${ENVIRONMENT}/deployment.yaml"
-        echo "Updating $FILE with image digest $IMAGE_DIGEST"
         sed -i "s|image: .*|image: $ECR_REPO@${IMAGE_DIGEST}|g" $FILE
 
-    # 6️⃣ Commit & push updated manifest (GitOps)
+    # 6️⃣ Commit & push updated manifest (skip for prod tags)
     - name: Commit & Push Updated Manifest
+      if: env.ENVIRONMENT != 'prod'
       run: |
         git config user.name "github-actions"
         git config user.email "github-actions@github.com"
-
         git add .
-        git diff-index --quiet HEAD || git commit -m "Deploy image ${IMAGE_TAG} to ${ENVIRONMENT} environment"
-
+        git diff-index --quiet HEAD || git commit -m "Deploy image ${IMAGE_TAG} to ${ENVIRONMENT}"
         git remote set-url origin https://x-access-token:${{ secrets.PERSONAL_ACCESS_TOKEN }}@github.com/abhi10011990/manifests-repo.git
         git push origin main
 
@@ -104,23 +94,20 @@ jobs:
     - name: Install kubectl
       uses: azure/setup-kubectl@v3
 
-    # 8️⃣ Update kubeconfig only if cluster exists
-    - name: Update kubeconfig for EKS
+    # 8️⃣ Update kubeconfig for EKS
+    - name: Update kubeconfig
       run: |
-        echo "Checking if cluster $CLUSTER_NAME exists..."
         if aws eks describe-cluster --name $CLUSTER_NAME --region $AWS_REGION >/dev/null 2>&1; then
-          echo "Cluster exists → updating kubeconfig."
           aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME
         else
-          echo "⚠️ Cluster not found → skipping deployment for $ENVIRONMENT. No failure."
+          echo "⚠️ Cluster not found, skipping deployment"
         fi
 
-    # 9️⃣ Apply manifest if kubeconfig is available
-    - name: Apply Manifest to Kubernetes
+    # 9️⃣ Apply manifest if kubeconfig exists
+    - name: Apply manifest
       run: |
         if kubectl config current-context >/dev/null 2>&1; then
-          echo "Deploying to Kubernetes environment $ENVIRONMENT..."
           kubectl apply -f ${ENVIRONMENT}/deployment.yaml
         else
-          echo "⚠️ No kubeconfig context → Skipping deployment. Cluster not created yet."
+          echo "⚠️ No kubeconfig context, skipping deployment"
         fi
