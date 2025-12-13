@@ -8,13 +8,16 @@ jobs:
   cd:
     runs-on: ubuntu-latest
 
+    # 🔴 THIS LINE ENABLES GITHUB ENVIRONMENTS + APPROVALS
+    environment: ${{ env.ENVIRONMENT }}
+
     env:
       AWS_REGION: ap-northeast-1
       ECR_REPO: 541320879609.dkr.ecr.ap-northeast-1.amazonaws.com/cicd
 
     steps:
 
-    # 1️⃣ Checkout manifests repo
+    # 1️⃣ Checkout manifests repository (GitOps)
     - name: Checkout manifests repo
       uses: actions/checkout@v3
       with:
@@ -28,8 +31,8 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ secrets.AWS_REGION }}
 
-    # 3️⃣ Extract Payload from CI (image tag, digest, branch)
-    - name: Extract Payload
+    # 3️⃣ Extract & validate payload from CI
+    - name: Extract Payload (with validation)
       run: |
         IMAGE_TAG="${{ github.event.client_payload.image_tag }}"
         IMAGE_DIGEST="${{ github.event.client_payload.image_digest }}"
@@ -41,7 +44,7 @@ jobs:
         echo "BRANCH_NAME=$BRANCH_NAME"
 
         if [[ -z "$IMAGE_TAG" || -z "$IMAGE_DIGEST" || -z "$BRANCH_NAME" ]]; then
-          echo "❌ ERROR: Missing payload from CI. Exiting."
+          echo "❌ ERROR: Missing payload from CI. Failing CD safely."
           exit 1
         fi
 
@@ -49,7 +52,7 @@ jobs:
         echo "IMAGE_DIGEST=$IMAGE_DIGEST" >> $GITHUB_ENV
         echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
 
-    # 4️⃣ Determine Target Environment & Cluster
+    # 4️⃣ Determine environment & cluster based on branch
     - name: Determine Target Environment
       run: |
         case "$BRANCH_NAME" in
@@ -75,20 +78,25 @@ jobs:
             ;;
         esac
 
-    # 5️⃣ Update Kubernetes Manifest with digest (immutable image)
+        echo "🚀 Deploying to environment: $ENVIRONMENT"
+        echo "🎯 Target cluster: $CLUSTER_NAME"
+
+    # 5️⃣ Update Kubernetes manifest using IMAGE DIGEST (immutable)
     - name: Update Kubernetes Manifest
       run: |
         FILE="${ENVIRONMENT}/deployment.yaml"
         echo "Updating $FILE with image digest $IMAGE_DIGEST"
         sed -i "s|image: .*|image: $ECR_REPO@${IMAGE_DIGEST}|g" $FILE
 
-    # 6️⃣ Commit & Push Updated Manifest using PAT
+    # 6️⃣ Commit & push updated manifest (GitOps)
     - name: Commit & Push Updated Manifest
       run: |
         git config user.name "github-actions"
         git config user.email "github-actions@github.com"
+
         git add .
         git diff-index --quiet HEAD || git commit -m "Deploy image ${IMAGE_TAG} to ${ENVIRONMENT} environment"
+
         git remote set-url origin https://x-access-token:${{ secrets.PERSONAL_ACCESS_TOKEN }}@github.com/abhi10011990/manifests-repo.git
         git push origin main
 
@@ -96,7 +104,7 @@ jobs:
     - name: Install kubectl
       uses: azure/setup-kubectl@v3
 
-    # 8️⃣ Update kubeconfig (skip if cluster not created)
+    # 8️⃣ Update kubeconfig only if cluster exists
     - name: Update kubeconfig for EKS
       run: |
         echo "Checking if cluster $CLUSTER_NAME exists..."
@@ -107,7 +115,7 @@ jobs:
           echo "⚠️ Cluster not found → skipping deployment for $ENVIRONMENT. No failure."
         fi
 
-    # 9️⃣ Apply Manifest if cluster is configured
+    # 9️⃣ Apply manifest if kubeconfig is available
     - name: Apply Manifest to Kubernetes
       run: |
         if kubectl config current-context >/dev/null 2>&1; then
