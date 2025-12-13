@@ -10,14 +10,15 @@ jobs:
 
     env:
       AWS_REGION: ap-northeast-1
+      ECR_REPO: 541320879609.dkr.ecr.ap-northeast-1.amazonaws.com/cicd
 
     steps:
 
-    # 1️⃣ Checkout manifests repo (NO CREDENTIAL OVERRIDE)
+    # 1️⃣ Checkout manifests repo
     - name: Checkout manifests repo
       uses: actions/checkout@v3
       with:
-        persist-credentials: false   # IMPORTANT: prevents GitHub from replacing your PAT
+        persist-credentials: false
 
     # 2️⃣ Configure AWS credentials
     - name: Configure AWS credentials
@@ -27,61 +28,75 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ secrets.AWS_REGION }}
 
-    # 3️⃣ Extract payload (image tag + branch)
+    # 3️⃣ Extract Payload from CI (image tag, digest, branch)
     - name: Extract Payload
       run: |
-        echo "IMAGE_TAG=${{ github.event.client_payload.image_tag }}" >> $GITHUB_ENV
-        echo "BRANCH_NAME=${{ github.event.client_payload.branch }}" >> $GITHUB_ENV
-        echo "Received IMAGE_TAG=$IMAGE_TAG"
-        echo "Received BRANCH_NAME=$BRANCH_NAME"
+        IMAGE_TAG="${{ github.event.client_payload.image_tag }}"
+        IMAGE_DIGEST="${{ github.event.client_payload.image_digest }}"
+        BRANCH_NAME="${{ github.event.client_payload.branch }}"
 
-    # 4️⃣ Dynamic Environment Mapping
-    - name: Determine Target Environment
-      run: |
-        if [[ "$BRANCH_NAME" == feature/* ]]; then
-          echo "ENVIRONMENT=dev" >> $GITHUB_ENV
-          echo "CLUSTER_NAME=eks-dev-cluster" >> $GITHUB_ENV
-        elif [[ "$BRANCH_NAME" == main ]]; then
-          echo "ENVIRONMENT=stage" >> $GITHUB_ENV
-          echo "CLUSTER_NAME=eks-stage-cluster" >> $GITHUB_ENV
-        elif [[ "$BRANCH_NAME" == release/* ]]; then
-          echo "ENVIRONMENT=uat" >> $GITHUB_ENV
-          echo "CLUSTER_NAME=eks-uat-cluster" >> $GITHUB_ENV
-        elif [[ "$BRANCH_NAME" == production ]]; then
-          echo "ENVIRONMENT=prod" >> $GITHUB_ENV
-          echo "CLUSTER_NAME=eks-prod-cluster" >> $GITHUB_ENV
-        else
-          echo "ENVIRONMENT=dev" >> $GITHUB_ENV
-          echo "CLUSTER_NAME=eks-dev-cluster" >> $GITHUB_ENV
+        echo "🔍 Payload received from CI:"
+        echo "IMAGE_TAG=$IMAGE_TAG"
+        echo "IMAGE_DIGEST=$IMAGE_DIGEST"
+        echo "BRANCH_NAME=$BRANCH_NAME"
+
+        if [[ -z "$IMAGE_TAG" || -z "$IMAGE_DIGEST" || -z "$BRANCH_NAME" ]]; then
+          echo "❌ ERROR: Missing payload from CI. Exiting."
+          exit 1
         fi
 
-    # 5️⃣ Update Kubernetes Manifest
+        echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+        echo "IMAGE_DIGEST=$IMAGE_DIGEST" >> $GITHUB_ENV
+        echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
+
+    # 4️⃣ Determine Target Environment & Cluster
+    - name: Determine Target Environment
+      run: |
+        case "$BRANCH_NAME" in
+          feature/*)
+            echo "ENVIRONMENT=dev" >> $GITHUB_ENV
+            echo "CLUSTER_NAME=eks-dev-cluster" >> $GITHUB_ENV
+            ;;
+          main)
+            echo "ENVIRONMENT=stage" >> $GITHUB_ENV
+            echo "CLUSTER_NAME=eks-stage-cluster" >> $GITHUB_ENV
+            ;;
+          release/*)
+            echo "ENVIRONMENT=uat" >> $GITHUB_ENV
+            echo "CLUSTER_NAME=eks-uat-cluster" >> $GITHUB_ENV
+            ;;
+          production)
+            echo "ENVIRONMENT=prod" >> $GITHUB_ENV
+            echo "CLUSTER_NAME=eks-prod-cluster" >> $GITHUB_ENV
+            ;;
+          *)
+            echo "ENVIRONMENT=dev" >> $GITHUB_ENV
+            echo "CLUSTER_NAME=eks-dev-cluster" >> $GITHUB_ENV
+            ;;
+        esac
+
+    # 5️⃣ Update Kubernetes Manifest with digest (immutable image)
     - name: Update Kubernetes Manifest
       run: |
         FILE="${ENVIRONMENT}/deployment.yaml"
-        echo "Updating $FILE with image tag $IMAGE_TAG"
-        sed -i "s|image: .*|image: 541320879609.dkr.ecr.ap-northeast-1.amazonaws.com/cicd:${IMAGE_TAG}|g" $FILE
+        echo "Updating $FILE with image digest $IMAGE_DIGEST"
+        sed -i "s|image: .*|image: $ECR_REPO@${IMAGE_DIGEST}|g" $FILE
 
-    # 6️⃣ Commit & Push using PAT (NO MORE 403 ERRORS)
+    # 6️⃣ Commit & Push Updated Manifest using PAT
     - name: Commit & Push Updated Manifest
       run: |
         git config user.name "github-actions"
         git config user.email "github-actions@github.com"
-
         git add .
         git diff-index --quiet HEAD || git commit -m "Deploy image ${IMAGE_TAG} to ${ENVIRONMENT} environment"
-
-        # IMPORTANT: change remote to PAT-authenticated URL
         git remote set-url origin https://x-access-token:${{ secrets.PERSONAL_ACCESS_TOKEN }}@github.com/abhi10011990/manifests-repo.git
-
-        # Push to main
         git push origin main
 
     # 7️⃣ Install kubectl
     - name: Install kubectl
       uses: azure/setup-kubectl@v3
 
-    # 8️⃣ Update kubeconfig (Skip if cluster not created)
+    # 8️⃣ Update kubeconfig (skip if cluster not created)
     - name: Update kubeconfig for EKS
       run: |
         echo "Checking if cluster $CLUSTER_NAME exists..."
@@ -89,16 +104,15 @@ jobs:
           echo "Cluster exists → updating kubeconfig."
           aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME
         else
-          echo "❗ Cluster not found → skipping deployment. (Create EKS later)"
+          echo "⚠️ Cluster not found → skipping deployment for $ENVIRONMENT. No failure."
         fi
 
-    # 9️⃣ Apply manifest ONLY if cluster is configured
+    # 9️⃣ Apply Manifest if cluster is configured
     - name: Apply Manifest to Kubernetes
       run: |
         if kubectl config current-context >/dev/null 2>&1; then
-          echo "Deploying to Kubernetes..."
+          echo "Deploying to Kubernetes environment $ENVIRONMENT..."
           kubectl apply -f ${ENVIRONMENT}/deployment.yaml
         else
-          echo "❗ No kubeconfig context → Skipping deployment."
-          echo "You can run locally using KinD or create EKS later."
+          echo "⚠️ No kubeconfig context → Skipping deployment. Cluster not created yet."
         fi
