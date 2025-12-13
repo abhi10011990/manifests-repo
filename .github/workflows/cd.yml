@@ -5,14 +5,20 @@ on:
     types: [deploy]
   push:
     tags:
-      - 'v*.*.*'  # triggers production on version tag
+      - 'v*.*.*'   # Production release via tag
 
 jobs:
   cd:
     runs-on: ubuntu-latest
 
-    # Environment is dynamically set based on branch/tag
-    environment: ${{ env.ENVIRONMENT }}
+    # ✅ Environment must be resolved BEFORE steps run
+    environment: >
+      ${{
+        startsWith(github.event.client_payload.branch, 'feature/') && 'dev' ||
+        github.event.client_payload.branch == 'main' && 'stage' ||
+        startsWith(github.event.client_payload.branch, 'release/') && 'uat' ||
+        startsWith(github.ref, 'refs/tags/v') && 'prod'
+      }}
 
     env:
       AWS_REGION: ap-northeast-1
@@ -20,7 +26,7 @@ jobs:
 
     steps:
 
-    # 1️⃣ Checkout manifests repo
+    # 1️⃣ Checkout manifests repo (GitOps)
     - name: Checkout manifests repo
       uses: actions/checkout@v3
       with:
@@ -34,59 +40,50 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ secrets.AWS_REGION }}
 
-    # 3️⃣ Extract payload
+    # 3️⃣ Extract & validate payload
     - name: Extract Payload
       run: |
         IMAGE_TAG="${{ github.event.client_payload.image_tag }}"
         IMAGE_DIGEST="${{ github.event.client_payload.image_digest }}"
         BRANCH_NAME="${{ github.event.client_payload.branch }}"
-        TAG_NAME="${{ github.ref_name }}"
+
+        echo "IMAGE_TAG=$IMAGE_TAG"
+        echo "IMAGE_DIGEST=$IMAGE_DIGEST"
+        echo "BRANCH_NAME=$BRANCH_NAME"
+
+        if [[ -z "$IMAGE_DIGEST" ]]; then
+          echo "❌ Missing image digest"
+          exit 1
+        fi
 
         echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
         echo "IMAGE_DIGEST=$IMAGE_DIGEST" >> $GITHUB_ENV
         echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
-        echo "TAG_NAME=$TAG_NAME" >> $GITHUB_ENV
 
-    # 4️⃣ Determine environment and cluster
-    - name: Determine Target Environment
+    # 4️⃣ Map cluster AFTER environment is already locked
+    - name: Set Cluster Name
       run: |
-        case "$BRANCH_NAME" in
-          feature/*)
-            echo "ENVIRONMENT=dev" >> $GITHUB_ENV
-            echo "CLUSTER_NAME=eks-dev-cluster" >> $GITHUB_ENV
-            ;;
-          main)
-            echo "ENVIRONMENT=stage" >> $GITHUB_ENV
-            echo "CLUSTER_NAME=eks-stage-cluster" >> $GITHUB_ENV
-            ;;
-          release/*)
-            echo "ENVIRONMENT=uat" >> $GITHUB_ENV
-            echo "CLUSTER_NAME=eks-uat-cluster" >> $GITHUB_ENV
-            ;;
-          production|v*.*.*)
-            echo "ENVIRONMENT=prod" >> $GITHUB_ENV
-            echo "CLUSTER_NAME=eks-prod-cluster" >> $GITHUB_ENV
-            ;;
-          *)
-            echo "ENVIRONMENT=dev" >> $GITHUB_ENV
-            echo "CLUSTER_NAME=eks-dev-cluster" >> $GITHUB_ENV
-            ;;
+        case "${{ job.environment }}" in
+          dev)   echo "CLUSTER_NAME=eks-dev-cluster" >> $GITHUB_ENV ;;
+          stage) echo "CLUSTER_NAME=eks-stage-cluster" >> $GITHUB_ENV ;;
+          uat)   echo "CLUSTER_NAME=eks-uat-cluster" >> $GITHUB_ENV ;;
+          prod)  echo "CLUSTER_NAME=eks-prod-cluster" >> $GITHUB_ENV ;;
         esac
 
-    # 5️⃣ Update Kubernetes manifest with immutable image
+    # 5️⃣ Update Kubernetes manifest using IMAGE DIGEST
     - name: Update Kubernetes Manifest
       run: |
-        FILE="${ENVIRONMENT}/deployment.yaml"
+        FILE="${{ job.environment }}/deployment.yaml"
         sed -i "s|image: .*|image: $ECR_REPO@${IMAGE_DIGEST}|g" $FILE
 
-    # 6️⃣ Commit & push updated manifest (skip for prod tags)
-    - name: Commit & Push Updated Manifest
-      if: env.ENVIRONMENT != 'prod'
+    # 6️⃣ Commit & push (GitOps) — skip for prod tag
+    - name: Commit & Push Manifest
+      if: job.environment != 'prod'
       run: |
         git config user.name "github-actions"
         git config user.email "github-actions@github.com"
         git add .
-        git diff-index --quiet HEAD || git commit -m "Deploy image ${IMAGE_TAG} to ${ENVIRONMENT}"
+        git commit -m "Deploy ${IMAGE_TAG} to ${{ job.environment }}" || echo "No changes"
         git remote set-url origin https://x-access-token:${{ secrets.PERSONAL_ACCESS_TOKEN }}@github.com/abhi10011990/manifests-repo.git
         git push origin main
 
@@ -94,20 +91,20 @@ jobs:
     - name: Install kubectl
       uses: azure/setup-kubectl@v3
 
-    # 8️⃣ Update kubeconfig for EKS
+    # 8️⃣ Update kubeconfig only if cluster exists
     - name: Update kubeconfig
       run: |
         if aws eks describe-cluster --name $CLUSTER_NAME --region $AWS_REGION >/dev/null 2>&1; then
           aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME
         else
-          echo "⚠️ Cluster not found, skipping deployment"
+          echo "⚠️ Cluster not created yet — skipping"
         fi
 
-    # 9️⃣ Apply manifest if kubeconfig exists
-    - name: Apply manifest
+    # 9️⃣ Apply manifest
+    - name: Apply Manifest
       run: |
         if kubectl config current-context >/dev/null 2>&1; then
-          kubectl apply -f ${ENVIRONMENT}/deployment.yaml
+          kubectl apply -f ${{ job.environment }}/deployment.yaml
         else
-          echo "⚠️ No kubeconfig context, skipping deployment"
+          echo "⚠️ No kubeconfig context — skipping"
         fi
