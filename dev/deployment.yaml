@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: demo-app
-          image: PLACEHOLDER_IMAGE
+          image: 541320879609.dkr.ecr.ap-northeast-1.amazonaws.com/cicd:15-af562d4122836469671cb6cfeb132c978528407b
           ports:
             - containerPort: 8080
           resources:
